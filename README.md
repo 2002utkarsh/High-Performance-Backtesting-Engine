@@ -1,4 +1,4 @@
-# High-Performance Trading & Backtesting Engine
+# High-Performance Backtesting Engine
 
 A high-speed, modular trading and backtesting engine built in **C++** and **Python**.  
 This project combines low-latency performance with a fully automated trading pipeline — from data ingestion to live execution.
