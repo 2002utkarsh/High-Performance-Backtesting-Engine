@@ -10,7 +10,7 @@ This project combines low-latency performance with a fully automated trading pip
 This system is designed to efficiently **backtest and execute algorithmic trading strategies** on cryptocurrency markets.  
 It provides a C++ engine optimized for high event throughput, and a Python automation layer for live trading and analytics.
 
-- **Backtesting Engine:** Capable of processing **160,000+ events/second** over **1.6M historical data points**.
+- **Backtesting Engine:** Capable of processing **350,000+ events/second** over **1.6M historical data points**.
 - **Trading Pipeline:** Automates screening, signal generation, and trade execution using real-time data from the **KuCoin API**.
 - **Extensible Architecture:** Built to support multiple exchanges, strategies, and asset classes with minimal modification.
 

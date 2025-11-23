@@ -1,0 +1,12 @@
+ticker: "AAPL"
+start: "2021-01-01"
+end: "2025-01-01"
+initial_cash: 10000.0
+
+strategy:
+  name: "ai_transformer"
+  params:
+    seq_len: 60
+    epochs: 50
+    lookahead: 5
+    model_path: "model.pth"

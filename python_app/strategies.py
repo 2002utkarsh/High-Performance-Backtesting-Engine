@@ -13,6 +13,7 @@ Strategies:
  - rsi_macd_hybrid(...)
  - bollinger_mean_reversion(...)
  - ml_short_term(...)
+ - ai_transformer_strategy(...)
 
 These are designed to plug directly into the BacktestManager pipeline.
 """
@@ -22,10 +23,22 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import DataLoader
+    from ai_model import TimeSeriesTransformer, StockDataset, train_model, predict
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+    print("Warning: PyTorch not found. AI strategies will be disabled.")
 
 
 # -------------------------------------------------
-# Strategy registry — maps names in config.yaml to functions
+# Strategy registry - maps names in config.yaml to functions
 # ------------------------------------------------
 
 
@@ -33,6 +46,7 @@ from sklearn.model_selection import train_test_split
 # Indicator helpers
 # -------------------------
 def ema(series: pd.Series, span: int) -> pd.Series:
+    """Calculates Exponential Moving Average."""
     return series.ewm(span=span, adjust=False).mean()
 
 
@@ -96,7 +110,7 @@ def rsi_macd_hybrid(df: pd.DataFrame,
     buy_cond = (rsi_vals < rsi_oversold) & macd_cross_up
     sell_cond = (rsi_vals > rsi_overbought) & macd_cross_down
 
-    # Build a position series: +1 when buy, 0 when hold, -1 when sell — using diff of "in/out"
+    # Build a position series: +1 when buy, 0 when hold, -1 when sell - using diff of "in/out"
     raw = pd.Series(0, index=df.index, dtype=int)
     raw[buy_cond.fillna(False)] = 1
     raw[sell_cond.fillna(False)] = -1
@@ -134,7 +148,7 @@ def bollinger_mean_reversion(df: pd.DataFrame,
     signals[cross_below.fillna(False)] = 1   # buy
     signals[cross_above.fillna(False)] = -1  # sell
 
-    # Optionally: if within_exit after buy, emit a sell to close — but to avoid double-selling,
+    # Optionally: if within_exit after buy, emit a sell to close - but to avoid double-selling,
     # we use position tracking externally (C++ engine does 1-share per signal).
     # Keep outputs as immediate signals only.
     return signals
@@ -180,7 +194,7 @@ def ml_short_term(df: pd.DataFrame,
     # Drop last lookahead rows where target is NaN
     df.dropna(inplace=True)
     if len(df) < min_train_size:
-        # Not enough data to train — return zeros
+        # Not enough data to train - return zeros
         return pd.Series(0, index=df.index).reindex(close.index, fill_value=0).astype(int)
 
     feature_cols = ["ret_1", "ret_3", "ret_5", "sma_5", "sma_10", "sma_20", "vol_10", "macd", "macd_sig", "rsi_14"]
@@ -211,6 +225,119 @@ def ml_short_term(df: pd.DataFrame,
 
     # Reindex to full original index (fill missing zeros)
     return signals.reindex(close.index, fill_value=0).astype(int)
+
+
+# -------------------------
+# Strategy 4: AI Transformer Strategy (PyTorch) - Regression Version
+# -------------------------
+def ai_transformer_strategy(df: pd.DataFrame, 
+                            seq_len: int = 60,  # Increased context
+                            epochs: int = 50,   # Increased training
+                            lookahead: int = 5,
+                            buy_threshold: float = 0.015,
+                            sell_threshold: float = -0.005,
+                            model_path: str = "model.pth") -> pd.Series:
+    """
+    Uses a Transformer model to predict EXACT future price.
+    Includes persistence (save/load) and advanced features.
+    """
+    if not HAS_TORCH:
+        print("PyTorch not installed. Returning zeros.")
+        return pd.Series(0, index=df.index)
+
+    # Import save/load dynamically to avoid circular imports if at top level
+    from ai_model import save_model, load_model
+
+    df = df.copy()
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    volume = df["volume"].astype(float)
+    
+    # -------------------------
+    # Feature Engineering
+    # -------------------------
+    # 1. Basic
+    df["ret"] = close.pct_change().fillna(0)
+    df["vol"] = df["ret"].rolling(20).std().fillna(0)
+    df["rsi"] = rsi(close)
+    macd_line, _ = macd(close)
+    df["macd"] = macd_line
+    
+    # 2. Advanced: ATR (Volatility)
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(14).mean().fillna(0)
+    
+    # 3. Advanced: Bollinger Width
+    mid, upper, lower = bollinger_bands(close)
+    df["bb_width"] = (upper - lower) / (mid + 1e-9)
+    
+    # 4. Advanced: Volume Change
+    df["vol_change"] = volume.pct_change().fillna(0)
+    
+    # 5. Advanced: Stochastic Oscillator
+    # %K = (Current Close - Lowest Low)/(Highest High - Lowest Low) * 100
+    # %D = 3-day SMA of %K
+    low_14 = low.rolling(14).min()
+    high_14 = high.rolling(14).max()
+    df["stoch_k"] = 100 * (close - low_14) / (high_14 - low_14 + 1e-9)
+    df["stoch_d"] = df["stoch_k"].rolling(3).mean().fillna(50)
+    
+    # Fill NaNs
+    df.fillna(0, inplace=True)
+    
+    # Normalize features
+    feature_cols = ["ret", "vol", "rsi", "macd", "atr", "bb_width", "vol_change", "stoch_k", "stoch_d"]
+    scaler = StandardScaler()
+    data = scaler.fit_transform(df[feature_cols])
+    
+    # Create targets: Actual Future Price
+    targets = close.shift(-lookahead).fillna(method='ffill').values
+    
+    # Train/Test Split (Chronological)
+    split_idx = int(len(data) * 0.8) # Train on more data
+    train_data = data[:split_idx]
+    train_targets = targets[:split_idx]
+    
+    # Dataset & Loader
+    train_dataset = StockDataset(train_data, train_targets, seq_len=seq_len)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    
+    # Model Setup
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = TimeSeriesTransformer(input_dim=len(feature_cols), output_dim=1, d_model=128, num_layers=4).to(device) # Deeper model
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.0005) # Slower learning rate for stability
+    
+    # Persistence Logic
+    loaded = load_model(model, path=model_path, device=device)
+    
+    if not loaded:
+        print(f"Training Regression Transformer on {len(train_dataset)} sequences (Epochs={epochs})...")
+        train_model(model, train_loader, criterion, optimizer, epochs=epochs, device=device)
+        save_model(model, path=model_path)
+    else:
+        print("Skipping training (Model loaded).")
+    
+    # Predict (Full dataset)
+    print("Generating price predictions...")
+    predicted_prices = predict(model, data, seq_len=seq_len, device=device)
+    
+    # Trading Logic
+    current_prices = close.values
+    predicted_prices = np.nan_to_num(predicted_prices, nan=current_prices[0])
+    predicted_return = (predicted_prices - current_prices) / (current_prices + 1e-9)
+    
+    target_position = pd.Series(0, index=df.index)
+    target_position[predicted_return > buy_threshold] = 1
+    target_position[predicted_return < sell_threshold] = 0 
+    
+    trade_signals = target_position.diff().fillna(0).astype(int)
+    
+    return trade_signals
 
 
 # -------------------------
@@ -264,4 +391,5 @@ STRATEGIES = {
     "bollinger_mean_reversion": bollinger_mean_reversion,
     "ml_short_term": ml_short_term,
     "ml_strategy": ml_strategy,
+    "ai_transformer": ai_transformer_strategy,
 }
